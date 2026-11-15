@@ -205,6 +205,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/go-viper/mapstructure/v2/internal/errors"
 )
@@ -386,6 +388,16 @@ type DecoderConfig struct {
 type Decoder struct {
 	config           *DecoderConfig
 	cachedDecodeHook func(from reflect.Value, to reflect.Value) (any, error)
+
+	// matchNameIsEqualFold reports whether config.MatchName is
+	// strings.EqualFold itself (the default). When it is, the fallback
+	// matching path can use a pre-built case-folded key index instead of
+	// scanning every map key for every struct field, while remaining
+	// exactly equivalent to strings.EqualFold.
+	//
+	// Custom MatchName implementations keep the exhaustive scan, since
+	// their matching semantics cannot be represented by a fixed index.
+	matchNameIsEqualFold bool
 }
 
 // Metadata contains information about decoding a structure that
@@ -507,8 +519,16 @@ func NewDecoder(config *DecoderConfig) (*Decoder, error) {
 		config.SquashTagOption = "squash"
 	}
 
+	// A nil MatchName means "use the default". An explicitly supplied
+	// strings.EqualFold value is detected by its code pointer so those
+	// users get the same optimized path; any other function keeps the
+	// exhaustive scan.
+	matchNameIsEqualFold := config.MatchName == nil
 	if config.MatchName == nil {
 		config.MatchName = strings.EqualFold
+	} else {
+		matchNameIsEqualFold = reflect.ValueOf(config.MatchName).Pointer() ==
+			reflect.ValueOf(strings.EqualFold).Pointer()
 	}
 
 	if config.MapFieldName == nil {
@@ -518,7 +538,8 @@ func NewDecoder(config *DecoderConfig) (*Decoder, error) {
 	}
 
 	result := &Decoder{
-		config: config,
+		config:               config,
+		matchNameIsEqualFold: matchNameIsEqualFold,
 	}
 	if config.DecodeHook != nil {
 		result.cachedDecodeHook = cachedDecodeHook(config.DecodeHook)
@@ -1550,12 +1571,21 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 			fmt.Errorf("needs a map with string keys, has %q keys", kind))
 	}
 
-	dataValKeys := make(map[reflect.Value]struct{})
-	dataValKeysUnused := make(map[any]struct{})
-	for _, dataValKey := range dataVal.MapKeys() {
-		dataValKeys[dataValKey] = struct{}{}
+	dataValKeysList := dataVal.MapKeys()
+	dataValKeysUnused := make(map[any]struct{}, len(dataValKeysList))
+	for _, dataValKey := range dataValKeysList {
 		dataValKeysUnused[dataValKey.Interface()] = struct{}{}
 	}
+
+	// foldIndex groups this map's string keys by their case-folded form. It
+	// is only built (once per map) when the default strings.EqualFold
+	// matcher is in use and a field's direct lookup misses, so the common
+	// exact-match path pays nothing for it. See foldKey.
+	var foldIndex map[string][]foldIndexEntry
+
+	// For small maps a linear scan is cheaper than building (and folding) an
+	// index, so the index is only used past foldIndexMinKeys keys.
+	useFoldIndex := d.matchNameIsEqualFold && len(dataValKeysList) >= foldIndexMinKeys
 
 	targetValKeysUnused := make(map[any]struct{})
 
@@ -1672,19 +1702,32 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 		rawMapKey := reflect.ValueOf(fieldName)
 		rawMapVal := dataVal.MapIndex(rawMapKey)
 		if !rawMapVal.IsValid() {
-			// Do a slower search by iterating over each key and
-			// doing case-insensitive search.
-			for dataValKey := range dataValKeys {
-				mK, ok := dataValKey.Interface().(string)
-				if !ok {
-					// Not a string key
-					continue
+			// Fall back to match-name comparison. With the default
+			// strings.EqualFold matcher and a wide enough map this is
+			// answered from a case-folded key index instead of scanning
+			// every map key; the index is built lazily on the first miss,
+			// then reused for this map.
+			//
+			// Any other MatchName (and small maps) keep the exhaustive scan,
+			// which preserves custom matching semantics exactly.
+			if useFoldIndex {
+				if foldIndex == nil {
+					foldIndex = buildFoldIndex(dataValKeysList)
 				}
+				rawMapKey, rawMapVal = lookupFoldIndex(foldIndex, dataVal, fieldName)
+			} else {
+				for _, dataValKey := range dataValKeysList {
+					mK, ok := dataValKey.Interface().(string)
+					if !ok {
+						// Not a string key
+						continue
+					}
 
-				if d.config.MatchName(mK, fieldName) {
-					rawMapKey = dataValKey
-					rawMapVal = dataVal.MapIndex(dataValKey)
-					break
+					if d.config.MatchName(mK, fieldName) {
+						rawMapKey = dataValKey
+						rawMapVal = dataVal.MapIndex(dataValKey)
+						break
+					}
 				}
 			}
 
@@ -1799,6 +1842,116 @@ func (d *Decoder) decodeStructFromMap(name string, dataVal, val reflect.Value) e
 	}
 
 	return nil
+}
+
+// foldIndexMinKeys is the smallest map (in keys) for which the fallback
+// matching path builds the case-folded key index. Below it a linear scan over
+// the keys is cheaper than folding every key into an index, and it keeps the
+// old behaviour for the small maps that dominate typical decoding.
+const foldIndexMinKeys = 32
+
+// foldIndexEntry is one string key of the input map, kept next to the
+// reflect.Value used to look its value back up.
+type foldIndexEntry struct {
+	str string
+	key reflect.Value
+}
+
+// buildFoldIndex groups the given map keys by their case-folded form. Only
+// string keys (in maps whose key kind is Interface) are indexed; they are
+// exactly the keys the default strings.EqualFold fallback scan could match.
+// Buckets keep the order of dataVal.MapKeys().
+func buildFoldIndex(keys []reflect.Value) map[string][]foldIndexEntry {
+	index := make(map[string][]foldIndexEntry, len(keys))
+	for _, key := range keys {
+		s, ok := key.Interface().(string)
+		if !ok {
+			// Not a string key
+			continue
+		}
+		fold := foldKey(s)
+		index[fold] = append(index[fold], foldIndexEntry{str: s, key: key})
+	}
+	return index
+}
+
+// lookupFoldIndex returns the first key in dataVal that is strings.EqualFold
+// to fieldName, or an invalid value if there is none. Candidates come from the
+// pre-built index and are re-checked with strings.EqualFold, so the answer is
+// exactly what an exhaustive strings.EqualFold scan would have produced.
+func lookupFoldIndex(index map[string][]foldIndexEntry, dataVal reflect.Value, fieldName string) (reflect.Value, reflect.Value) {
+	for _, entry := range index[foldKey(fieldName)] {
+		if !strings.EqualFold(entry.str, fieldName) {
+			continue
+		}
+		if val := dataVal.MapIndex(entry.key); val.IsValid() {
+			return entry.key, val
+		}
+	}
+	return reflect.Value{}, reflect.Value{}
+}
+
+// foldKey maps a string to a canonical form such that
+//
+//	foldKey(a) == foldKey(b)  <=>  strings.EqualFold(a, b)
+//
+// It replaces every rune with the minimum rune of its unicode.SimpleFold
+// orbit. EqualFold compares runes by walking the same orbit, so equal-fold
+// runes share an orbit minimum; ASCII letters map to their upper-case form,
+// which keeps the common case cheap.
+func foldKey(s string) string {
+	// Fast path: pure ASCII with no lower-case letters is already canonical.
+	ascii := true
+	for i := 0; i < len(s); i++ {
+		if s[i] >= utf8.RuneSelf {
+			ascii = false
+			break
+		}
+	}
+	if ascii {
+		hasLower := false
+		for i := 0; i < len(s); i++ {
+			if 'a' <= s[i] && s[i] <= 'z' {
+				hasLower = true
+				break
+			}
+		}
+		if !hasLower {
+			return s
+		}
+
+		buf := []byte(s)
+		for i := 0; i < len(buf); i++ {
+			if 'a' <= buf[i] && buf[i] <= 'z' {
+				buf[i] -= 'a' - 'A'
+			}
+		}
+		return string(buf)
+	}
+
+	runes := []rune(s)
+	for i, r := range runes {
+		runes[i] = foldRune(r)
+	}
+	return string(runes)
+}
+
+// foldRune returns the minimum rune of r's unicode.SimpleFold orbit.
+func foldRune(r rune) rune {
+	if r < utf8.RuneSelf {
+		if 'a' <= r && r <= 'z' {
+			return r - ('a' - 'A')
+		}
+		return r
+	}
+
+	min := r
+	for f := unicode.SimpleFold(r); f != r; f = unicode.SimpleFold(f) {
+		if f < min {
+			min = f
+		}
+	}
+	return min
 }
 
 func isEmptyValue(v reflect.Value) bool {
